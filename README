@@ -2,8 +2,8 @@ A C++ class to synchronously control and receive telemetry data from a plane/cop
 
 
 To build:
-	Run `mkdir build` in the repo root
-	`cd build` and run `cmake ..`
-	Then run `make -j`
+	* Run mkdir build in the repo root and cd into build
+	* Run cmake ../
+	* Then run make -j
 	
 
