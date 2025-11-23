@@ -1,0 +1,9 @@
+A C++ class to synchronously control and receive telemetry data from a plane/copter in RealFlight Evolution
+
+
+To build:
+	Run `mkdir build` in the repo root
+	`cd build` and run `cmake ..`
+	Then run `make -j`
+	
+
