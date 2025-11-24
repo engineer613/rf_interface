@@ -16,8 +16,10 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 # Create library
 add_library(rfinterface STATIC
+    src/joystick.hpp
+    src/socketpool.hpp
     src/RFInterface.cpp
-    src/RFInterface.h
+    src/RFInterface.hpp
 )
 
 # Link pthread for threading support

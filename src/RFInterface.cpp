@@ -1,4 +1,3 @@
-#include "RFInterface.h"
 #include <cstring>
 #include <cstdio>
 #include <cstdarg>
@@ -9,157 +8,163 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/select.h>
+
 #include <thread>
 #include <chrono>
 #include <iostream>
 #include <sstream>
 
-namespace RF {
+#include "RFInterface.hpp"
+#include "joystick.hpp"
 
-// Connection pool for managing sockets- Realflight does not allow using the same socket 
-// for multiple SOAP requests according to docs floating around online
-class SocketPool {
-public:
-    SocketPool(const char* ip, uint16_t port, size_t pool_size = 5) 
-        : server_ip(ip), server_port(port), max_pool_size(pool_size), shutdown_flag(false) {
-        // Start background thread to create connections
-        pool_thread = std::thread(&SocketPool::maintain_pool, this);
-        
-        // Wait for initial connections
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    
-    ~SocketPool() {
-        shutdown_flag = true;
-        if (pool_thread.joinable()) {
-            pool_thread.join();
-        }
-        
-        // Close all remaining sockets
-        std::lock_guard<std::mutex> lock(pool_mutex);
-        while (!available_sockets.empty()) {
-            close(available_sockets.front());
-            available_sockets.pop();
-        }
-    }
-    
-    int get_socket() {
-        std::lock_guard<std::mutex> lock(pool_mutex);
-        
-        if (available_sockets.empty()) {
-            // Create new connection if pool is empty
-            return create_connection();
-        }
-        
-        int sock = available_sockets.front();
-        available_sockets.pop();
-        return sock;
-    }
-    
-private:
-    int create_connection() {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) {
-            std::cerr << "Socket creation failed: " << strerror(errno) << std::endl;
-            return -1;
-        }
-        
-        struct sockaddr_in serv_addr;
-        memset(&serv_addr, 0, sizeof(serv_addr));
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(server_port);
-        
-        if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
-            std::cerr << "Invalid address: " << server_ip << std::endl;
-            close(sock);
-            return -1;
-        }
-        
-        // Set socket timeout
-        struct timeval tv;
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        
-        if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-            std::cerr << "Connection failed: " << strerror(errno) << std::endl;
-            close(sock);
-            return -1;
-        }
-        
-        return sock;
-    }
-    
-    void maintain_pool() {
-        while (!shutdown_flag) {
-            std::unique_lock<std::mutex> lock(pool_mutex);
-            size_t current_size = available_sockets.size();
-            lock.unlock();
-            
-            if (current_size < max_pool_size) {
-                int new_sock = create_connection();
-                if (new_sock >= 0) {
-                    lock.lock();
-                    available_sockets.push(new_sock);
-                    lock.unlock();
-                }
-            }
-            
-            // RF works better with no sleep
-            // std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    }
-    
-    const char* server_ip;
-    uint16_t server_port;
-    size_t max_pool_size;
-    std::queue<int> available_sockets;
-    std::mutex pool_mutex;
-    std::thread pool_thread;
-    bool shutdown_flag;
-};
+namespace RF {
 
 // Static socket pool
 static SocketPool* g_socket_pool = nullptr;
 
 RFInterface::RFInterface(const char* rf_ip, uint16_t rf_port) 
-    : rf_server_ip(rf_ip), rf_server_port(rf_port), sock_fd(-1), controller_started(false) {
-    
+    : rf_server_ip(rf_ip),
+      rf_server_port(rf_port),
+      sock_fd(-1),
+      m_connected(false),
+      m_joystick("/dev/input/event0") 
+{
     memset(&state, 0, sizeof(state));
     memset(reply_buffer, 0, sizeof(reply_buffer));
     
+    bool init_ok = false;
+
     // Initialize socket pool (pool size of 3 sockets)
     if (!g_socket_pool) {
         g_socket_pool = new SocketPool(rf_ip, rf_port, 3);
     }
-    
-    std::cout << "RFInterface initialized for " << rf_ip << ":" << rf_port << std::endl;
+
+    init_ok = (g_socket_pool == nullptr) ? false : true;
+        
+    if(init_ok &= connect()) {
+        std::cout << "RFInterface initialized for " << rf_ip << ":" << rf_port << std::endl;
+    }
+
+    // while(!m_joystick.is_reading()) {
+    //     // std::cout << "[UPDATE] RFInterface Waiting on Joystick to begin reading" << std::endl;
+    //     // std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // }
+
+    if (init_ok) {
+        m_update_thread = std::thread(&RFInterface::update, this);
+        std::cout << "[SUCCESS] RFInterface Connected Successfully" <<  std::endl;
+    } else {
+        std::cout << "[ERROR] RFInterface Initialization Failed" <<  std::endl;
+    }
 }
 
-void RFInterface::update(const struct control_input &input) {
-    if (!controller_started) {
-        // First call - inject controller interface
-        const char* inject_body = "<a>1</a><b>2</b>";
-        bool success = soap_request_start("InjectUAVControllerInterface", inject_body);
-        
-        if (success) {
-            char* response = soap_request_end(1000);
-            if (response) {
-                std::cout << "Controller interface injected successfully" << std::endl;
-                controller_started = true;
-            } else {
-                std::cerr << "Failed to get response for controller injection" << std::endl;
-                return;
-            }
-        } else {
-            std::cerr << "Failed to inject controller interface" << std::endl;
-            return;
-        }
+
+RFInterface::~RFInterface() {
+    disconnect();
+    m_joystick.stop_reading();
+}
+
+bool RFInterface::isRFConnected() {
+    return m_connected;
+}
+
+
+void RFInterface::update() {
+    while(m_connected) {
+        RFCmd cmd = m_joystick.getJoystickVals();
+        // std::cout << "\n\n===========\n" << 
+        // "Joy Command:\n" <<  
+        // "Aileron: " << cmd.aileron << "\n" <<
+        // "Elevator: " << cmd.elevator << "\n" <<
+        // "Rudder: " << cmd.rudder << "\n" <<
+        // "Throttle: " << cmd.throttle << "\n" <<
+        // "=============\n\n" << std::endl;
+
+        exchange_data(cmd);
+
+        // Works better without sleep
+        // std::this_thread::sleep_for(10ms);
+    }
+}
+
+
+bool RFInterface::connect() {
+    // Inject the UAV controller interface to take over from the internal RC
+    const char* empty_body = "";
+    if (!soap_request_start("InjectUAVControllerInterface", empty_body)) {
+        std::cerr << "Failed to send InjectUAVControllerInterface request" << std::endl;
+        return false;
     }
     
-    exchange_data(input);
+    char* response = soap_request_end(1000);
+    if (!response) {
+        std::cerr << "Failed to receive InjectUAVControllerInterface response" << std::endl;
+        return false;
+    }
+    
+    // Check if response indicates success (200 status)
+    if (strstr(response, "200 OK") != nullptr) {
+        std::cout << "External control enabled (RealFlight Link active)" << std::endl;
+        m_connected = true;
+        return true;
+    }
+    
+    std::cerr << "InjectUAVControllerInterface request failed" << std::endl;
+    return false;
 }
+
+
+bool RFInterface::disconnect() {
+    // Restore the original controller device (joystick/RC)
+    const char* empty_body = "";
+    if (!soap_request_start("RestoreOriginalControllerDevice", empty_body)) {
+        std::cerr << "Failed to send RestoreOriginalControllerDevice request" << std::endl;
+        return false;
+    }
+    
+    char* response = soap_request_end(1000);
+    if (!response) {
+        std::cerr << "Failed to receive RestoreOriginalControllerDevice response" << std::endl;
+        return false;
+    }
+    
+    // Check if response indicates success (200 status)
+    if (strstr(response, "200 OK") != nullptr) {
+        std::cout << "External control disabled (internal RC/joystick active)" << std::endl;
+        m_connected = false;
+        return true;
+    }
+    
+    std::cerr << "RestoreOriginalControllerDevice request failed" << std::endl;
+    return false;
+}
+
+
+
+bool RFInterface::reset_aircraft() {
+    // Reset aircraft position (equivalent to pressing spacebar in RealFlight)
+    const char* empty_body = "";
+    if (!soap_request_start("ResetAircraft", empty_body)) {
+        std::cerr << "Failed to send ResetAircraft request" << std::endl;
+        return false;
+    }
+    
+    char* response = soap_request_end(1000);
+    if (!response) {
+        std::cerr << "Failed to receive ResetAircraft response" << std::endl;
+        return false;
+    }
+    
+    // Check if response indicates success (200 status)
+    if (strstr(response, "200 OK") != nullptr) {
+        std::cout << "Aircraft reset to initial position" << std::endl;
+        return true;
+    }
+    
+    std::cerr << "ResetAircraft request failed" << std::endl;
+    return false;
+}
+
 
 bool RFInterface::soap_request_start(const char *action, const char *fmt, ...) {
     // Get socket from pool
@@ -215,6 +220,7 @@ bool RFInterface::soap_request_start(const char *action, const char *fmt, ...) {
     
     return true;
 }
+
 
 char* RFInterface::soap_request_end(uint32_t timeout_ms) {
     if (sock_fd < 0) {
@@ -272,7 +278,8 @@ char* RFInterface::soap_request_end(uint32_t timeout_ms) {
     return nullptr;
 }
 
-void RFInterface::exchange_data(const struct control_input &input) {
+
+void RFInterface::exchange_data(const struct RFCmd &input) {
     // Build control inputs XML
     std::stringstream body;
     body << "<pControlInputs>"
