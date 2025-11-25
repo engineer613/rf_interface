@@ -287,7 +287,19 @@ void RFInterface::exchange_data(const struct RFCmd &input) {
          << "<m-channelValues-0to1>";
     
     // Map control inputs to channels (0.0 to 1.0 range)
-    double channels[12] = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
+    double channels[12] = {
+        0.5,
+        0.5,
+        0.5, 
+        0.5, 
+        0.5, 
+        0.5, 
+        0.5, 
+        0, // Mode: Stability Control toggle. Different modes, order for different planes
+        0.5, 
+        0.5, 
+        0.5, 
+        0.5};
     
     // Map inputs to appropriate channels
     channels[0] = input.aileron;   // Roll

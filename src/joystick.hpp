@@ -111,13 +111,8 @@ private:
     }
 
 
-    // Map [0, 2040] to [-1, 1]
+    // Map [0, 2047] to [0, 1]
     float normalize(float val) {
-        return (val - AXIS_CENTER) / AXIS_RANGE;
-    }
-
-    // Throttle wants [0, 1]
-    float normalizeThrottle(float val) {
         if (val < AXIS_MIN) val = AXIS_MIN;
         if (val > AXIS_MAX) val = AXIS_MAX;
         return (val - AXIS_MIN) / (AXIS_MAX - AXIS_MIN);
@@ -140,7 +135,7 @@ private:
                 m_state.elevator = normalize(value);
                 break;
             case 2:
-                m_state.throttle = normalizeThrottle(value);
+                m_state.throttle = normalize(value);
                 break;
             case 3:
                 m_state.rudder = normalize(value);
